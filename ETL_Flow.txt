@@ -1,0 +1,158 @@
+## step 1 Loading all the data and creating bronze layer 
+
+from pyspark.sql import SparkSession
+spark = SparkSession.builder.appName("Bronze_layer").getOrCreate()
+orders_df = spark.read.option("header", True).csv("/user/haridsr8786/learning/current_orders.csv")
+orders_df.show()
+products_df = spark.read.option("header", True).csv("/user/haridsr8786/learning/product.csv")
+products_df.show()
+customers_df = spark.read.option("header", True).csv("/user/haridsr8786/learning/customer.csv")
+customers_df.show()
+
+orders_df.write.mode("overwrite").parquet("/user/haridsr8786/learning/bronze/orders")
+bronze_orders_df=spark.read.parquet("/user/haridsr8786/learning/bronze/orders")
+bronze_orders_df.show()
+products_df.write.mode("overwrite").parquet("/user/haridsr8786/learning/bronze/products")
+bronze_products_df=spark.read.parquet("/user/haridsr8786/learning/bronze/products")
+bronze_products_df.show()
+customers_df.write.mode("overwrite").parquet("/user/haridsr8786/learning/bronze/customers")
+bronze_customers_df=spark.read.parquet("/user/haridsr8786/learning/bronze/customers")
+bronze_customers_df.show()
+
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.appName("silver_layer").getOrCreate()
+bronze_orders_df=spark.read.parquet("/user/haridsr8786/learning/bronze/orders")
+bronze_products_df=spark.read.parquet("/user/haridsr8786/learning/bronze/products")
+bronze_customers_df=spark.read.parquet("/user/haridsr8786/learning/bronze/customers")
+
+
+silver_orders_df = bronze_orders_df.dropna(subset=["order_id"])
+silver_products_df = bronze_products_df.dropna(subset=["product_id"])
+silver_customers_df = bronze_customers_df.dropna(subset=["customer_id"])
+silver_orders_df.write.mode("overwrite").format("parquet").save("/user/haridsr8786/learning/silver/orders")
+silver_orders_df = spark.read.parquet("/user/haridsr8786/learning/silver/orders")
+
+silver_products_df.write.mode("overwrite").format("parquet").save("/user/haridsr8786/learning/silver/products")
+silver_products_df=spark.read.parquet("/user/haridsr8786/learning/silver/products")
+silver_customers_df.write.mode("overwrite").format("parquet").save("/user/haridsr8786/learning/silver/customers")
+silver_customers_df=spark.read.parquet("/user/haridsr8786/learning/silver/customers")
+
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, expr
+spark = SparkSession.builder.appName("Gold_layer").getOrCreate()
+final_orders=spark.read.parquet("/user/haridsr8786/learning/silver/orders")
+final_products = spark.read.parquet("/user/haridsr8786/learning/silver/products")
+final_customers = spark.read.parquet("/user/haridsr8786/learning/silver/customers")
+
+products_dimension = final_products.dropDuplicates(["product_id"]).select(
+    "product_id", "product_name", "category")
+
+customer_dimension = final_customers.dropDuplicates(["customer_id"]).select("customer_id", "customer_name", "customer_segment")
+ 
+
+fact_table = final_orders \
+    .join(final_customers, "customer_id", "left") \
+    .join(final_products, "product_id", "left") \
+    .withColumn("total_amount", col("quantity") * col("price")) \
+    .select(
+        "order_id", "order_date", "customer_id", "product_id",
+        "quantity", "price", "total_amount"
+    )
+denormalised_table = fact_table \
+    .join(products_dimension, "product_id", "left") \
+    .join(customer_dimension, "customer_id", "left") \
+    .select(
+        "order_id", "order_date",
+        "customer_id", "customer_name", "customer_segment",
+        "product_id", "product_name", "category",
+        "quantity", "price", "total_amount"
+    )
+
+customer_dimension.write.mode("overwrite").format("parquet").save("/user/haridsr8786/learning/final/customers")
+customer_dim = spark.read.parquet("/user/haridsr8786/learning/final/customers")
+
+products_dimension.write.mode("overwrite").format("parquet").save("/user/haridsr8786/learning/final/products")
+product_dim = spark.read.parquet("/user/haridsr8786/learning/final/products")
+
+fact_table.write.mode("overwrite").format("parquet").save("/user/haridsr8786/learning/final/fact_table")
+fact_table = spark.read.parquet("/user/haridsr8786/learning/final/fact_table")
+
+denormalised_table.write.mode("overwrite").format("parquet").save("/user/haridsr8786/learning/final/denormalised_table")
+denorm_table = spark.read.parquet("/user/haridsr8786/learning/final/denormalised_table")
+
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, row_number
+from pyspark.sql.window import Window
+spark = SparkSession.builder.appName("Incremental_merge").getOrCreate()
+new_orders_df = spark.read.option("header", True).csv("/user/haridsr8786/learning/new_orders.csv")
+new_orders_df.write.mode("overwrite").parquet("/user/haridsr8786/learning/bronze/orders")
+new_orders = spark.read.parquet("/user/haridsr8786/learning/bronze/orders")
+
+
+try:
+    old_silver_orders = spark.read.parquet("/user/haridsr8786/learning/silver/orders")
+except:
+    old_silver_orders = spark.createDataFrame([], new_orders.schema)
+
+
+final_silver_orders = old_silver_orders.union(new_orders)
+window_spec = Window.partitionBy("order_id").orderBy(col("order_date").desc())
+rank_orders = final_silver_orders.withColumn("row_num", row_number().over(window_spec))
+final_orders = rank_orders.filter(col("row_num") == 1).drop("row_num")
+
+final_orders.write.mode("overwrite").parquet("/user/haridsr8786/learning/temp_silver_orders")
+
+hadoop fs -rm -r /user/haridsr8786/learning/silver/orders
+hadoop fs -mv /user/haridsr8786/learning/temp_silver_orders /user/haridsr8786/learning/silver/orders
+
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, expr
+spark = SparkSession.builder.appName("append_goldlayer").getOrCreate()
+
+incremental_orders_df = spark.read.parquet("/user/haridsr8786/learning/silver/orders")
+incremental_customers_df = spark.read.parquet("/user/haridsr8786/learning/silver/customers")
+incremental_products_df = spark.read.parquet("/user/haridsr8786/learning/silver/products")
+
+customer_dim = incremental_customers_df.dropDuplicates(["customer_id"]).select(
+    "customer_id", "customer_name", "customer_segment"
+)
+
+products_dim = incremental_products_df.dropDuplicates(["product_id"]).select(
+    "product_id", "product_name", "category"
+)
+
+fact_table = incremental_orders_df \
+    .join(incremental_customers_df, "customer_id", "left") \
+    .join(incremental_products_df, "product_id", "left") \
+    .withColumn("total_amount", col("quantity") * col("price")) \
+    .select("order_id", "order_date", "customer_id", "product_id", "quantity", "price", "total_amount")
+fact_table.dropDuplicates(["order_id"]).write.mode("append").parquet("/user/haridsr8786/learning/final/fact_table")
+
+fact_table_df = spark.read.parquet("/user/haridsr8786/learning/final/fact_table")
+
+denorm_table = fact_table \
+    .join(products_dim, "product_id", "left") \
+    .join(customer_dim, "customer_id", "left") \
+    .select(
+        "order_id", "order_date", "customer_id", "customer_name", "customer_segment",
+        "product_id", "product_name", "category", "quantity", "price", "total_amount"
+    )
+
+denorm_table.write.mode("append").parquet("/user/haridsr8786/learning/final/denormalised_table")
+denorm_table_df = spark.read.parquet("/user/haridsr8786/learning/final/denormalised_table")
+
+
+
+
+
+
+
+
+
+
+
+
